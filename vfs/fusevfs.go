@@ -92,10 +92,11 @@ type FuseVfs struct {
 	store     *storage.Storage
 	mountPath string
 	server    *fuse.Server
+	dummyAttr map[string]*fuse.Attr
 }
 
 func MountVfs(store *storage.Storage, mountPath string, options []string) (*FuseVfs, error) {
-	fuseVfs := FuseVfs{nil, "", nil}
+	fuseVfs := FuseVfs{nil, "", nil, make(map[string]*fuse.Attr)}
 
 	pathFs := pathfs.NewPathNodeFs(&fuseVfs, nil)
 	conn := nodefs.NewFileSystemConnector(pathFs.Root(), nil)
@@ -161,6 +162,12 @@ func (vfs FuseVfs) Create(name string, flags uint32, mode uint32, context *fuse.
 func (vfs FuseVfs) GetAttr(name string, context *fuse.Context) (*fuse.Attr, fuse.Status) {
 	log.Infof(2, "BEGIN GetAttr(%v)", name)
 	defer log.Infof(2, "END GetAttr(%v)", name)
+
+	v, dummyPresent := vfs.dummyAttr[name]
+
+	if dummyPresent {
+		return v, fuse.OK
+	}
 
 	switch name {
 	case databaseFilename:
@@ -521,6 +528,8 @@ func (vfs FuseVfs) Symlink(fromPath string, linkName string, context *fuse.Conte
 	if err := tx.Commit(); err != nil {
 		log.Fatalf("could not commit transaction: %v", err)
 	}
+
+	vfs.dummyAttr[linkName] = &fuse.Attr{Mode: fuse.S_IFLNK | 0755, Size: uint64(stat.Size()), Mtime: uint64(stat.ModTime().Unix()), Mtimensec: uint32(stat.ModTime().Nanosecond())}
 
 	return fuse.OK
 }
