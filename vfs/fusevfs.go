@@ -26,6 +26,7 @@ import (
 	"github.com/oniony/TMSU/entities"
 	"github.com/oniony/TMSU/query"
 	"github.com/oniony/TMSU/storage"
+	"github.com/oniony/TMSU/common/fingerprint"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -461,11 +462,67 @@ func (vfs FuseVfs) String() string {
 	return "tmsu"
 }
 
-func (vfs FuseVfs) Symlink(value string, linkName string, context *fuse.Context) fuse.Status {
-	log.Infof(2, "BEGIN Symlink(%v, %v)", value, linkName)
-	defer log.Infof(2, "END Symlink(%v, %v)", value, linkName)
+func (vfs FuseVfs) Symlink(fromPath string, linkName string, context *fuse.Context) fuse.Status {
+	log.Infof(2, "BEGIN Symlink(%v, %v)", fromPath, linkName)
+	defer log.Infof(2, "END Symlink(%v, %v)", fromPath, linkName)
 
-	return fuse.ENOSYS
+	tx, err := vfs.store.Begin()
+	if err != nil {
+		log.Fatalf("could not begin transaction: %v", err)
+	}
+	defer tx.Commit()
+
+	settings, err := vfs.store.Settings(tx);
+	if err != nil {
+		log.Fatalf("could not load settings: %v", err)
+	}
+
+	pairs := vfs.tagValuePairsFromPath(tx, linkName)
+	if len(pairs) == 0 {
+		return fuse.EPERM
+	}
+
+	stat, err := os.Lstat(fromPath)
+	if err != nil {
+		log.Fatalf("could not stat file '%v'.", fromPath)
+	}
+
+	log.Infof(2, "%v: checking if file exists in database", fromPath)
+
+	file, err := vfs.store.FileByPath(tx, fromPath)
+	if err != nil {
+		log.Fatalf("%v: could not retrieve file: %v", fromPath, err)
+
+	}
+	if file == nil {
+		log.Infof(2, "%v: creating fingerprint", fromPath)
+
+		fp, err := fingerprint.Create(fromPath, settings.FileFingerprintAlgorithm(), settings.DirectoryFingerprintAlgorithm(), settings.SymlinkFingerprintAlgorithm())
+		if err != nil {
+			if !(os.IsNotExist(err) || os.IsPermission(err)) {
+				log.Fatalf("%v: could not create fingerprint: %v", fromPath, err)
+			}
+		}
+
+		log.Infof(2, "%v: adding file", fromPath)
+
+		file, err = vfs.store.AddFile(tx, fromPath, fp, stat.ModTime(), int64(stat.Size()), stat.IsDir())
+		if err != nil {
+			log.Fatalf("%v: could not add file to database: %v", fromPath, err)
+		}
+	}
+
+	for _, pair := range pairs {
+		if _, err = vfs.store.AddFileTag(tx, file.Id, pair.TagId, pair.ValueId); err != nil {
+			log.Fatalf("%v: could not apply tags: %v", fromPath, err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		log.Fatalf("could not commit transaction: %v", err)
+	}
+
+	return fuse.OK
 }
 
 func (vfs FuseVfs) Truncate(name string, offset uint64, context *fuse.Context) fuse.Status {
@@ -499,51 +556,22 @@ func (vfs FuseVfs) Unlink(name string, context *fuse.Context) fuse.Status {
 		// reply ok if file doesn't exist otherwise recursive deletes fail
 		return fuse.OK
 	}
-	path := vfs.splitPath(name)
 
-	switch path[0] {
-	case tagsDir:
-		dirName := path[len(path)-3]
-
-		var tagName, valueName string
-		if dirName[0] == '=' {
-			tagName = unescape(path[len(path)-4])
-			valueName = unescape(dirName[1:])
-		} else {
-			tagName = unescape(dirName)
-			valueName = ""
-		}
-
-		tag, err := vfs.store.TagByName(tx, tagName)
-		if err != nil {
-			log.Fatal(err)
-		}
-		if tag == nil {
-			log.Fatalf("could not retrieve tag '%v'.", tagName)
-		}
-
-		value, err := vfs.store.ValueByName(tx, valueName)
-		if err != nil {
-			log.Fatal(err)
-		}
-		if value == nil {
-			log.Fatalf("could not retrieve value '%v'.", valueName)
-		}
-
-		if err = vfs.store.DeleteFileTag(tx, fileId, tag.Id, value.Id); err != nil {
-			log.Fatal(err)
-		}
-
-		if err := tx.Commit(); err != nil {
-			log.Fatalf("could not commit transaction: %v", err)
-		}
-
-		return fuse.OK
-	case queriesDir:
+	pairs := vfs.tagValuePairsFromPath(tx, name)
+	if len(pairs) == 0 {
 		return fuse.EPERM
 	}
 
-	return fuse.ENOSYS
+
+	if err = vfs.store.DeleteFileTag(tx, fileId, pairs[len(pairs)-1].TagId, pairs[len(pairs)-1].ValueId); err != nil {
+		log.Fatal(err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		log.Fatalf("could not commit transaction: %v", err)
+	}
+
+	return fuse.OK
 }
 
 func (vfs FuseVfs) Utimens(name string, Atime *time.Time, Mtime *time.Time, context *fuse.Context) (code fuse.Status) {
@@ -1161,4 +1189,49 @@ func unescape(name string) string {
 	name = strings.Replace(name, "\u200B\u2215", `/`, -1)
 	name = strings.Replace(name, "\u200B\u2216", `\`, -1)
 	return name
+}
+
+func (vfs FuseVfs) tagValuePairsFromPath(tx *storage.Tx, name string) entities.TagIdValueIdPairs {
+	pairs := make(entities.TagIdValueIdPairs, 0)
+
+	path := vfs.splitPath(name)
+
+	if path[0] != tagsDir {
+		return nil
+	}
+
+	for i := 1; i < len(path); i++ {
+		if path[i] == filesDir {
+			break
+		}
+
+		var tagName, valueName string
+		tagName = unescape(path[i])
+		if i + 1 < len(path) && path[i + 1][0] == '=' {
+			valueName = unescape(path[i + 1][1:])
+			i++
+		} else {
+			valueName = ""
+		}
+
+		tag, err := vfs.store.TagByName(tx, tagName)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if tag == nil {
+			log.Fatalf("could not retrieve tag '%v'.", tagName)
+		}
+
+		value, err := vfs.store.ValueByName(tx, valueName)
+		if err != nil {
+			log.Fatal(err)
+		}
+		if value == nil {
+			log.Fatalf("could not retrieve value '%v'.", valueName)
+		}
+
+		pairs = append(pairs, entities.TagIdValueIdPair{tag.Id, value.Id})
+	}
+	
+	return pairs
 }
